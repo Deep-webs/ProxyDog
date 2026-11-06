@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+data/
+logs/
+venv/
+.idea/
+.vscode/
+*.db
+*.db-wal
+*.db-shm
+*.log
+secret.key
+first-login.txt
+ipclass_cache.json
+.geo.bin
+_tmp_check.js

@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ProxyDog · 登录</title>
+<style>
+  :root{
+    --bg:#12151a; --panel:#171b21; --line:#242a33; --text:#e6e9ee; --muted:#8b95a5;
+    --accent:#2ea36b; --danger:#e05561;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;height:100vh;display:flex;align-items:center;justify-content:center;
+    background:radial-gradient(1200px 600px at 50% -10%, #1b2530 0%, #12151a 60%);
+    color:var(--text);font:14px/1.6 "Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+  .card{width:360px;background:var(--panel);border:1px solid var(--line);
+    border-radius:14px;padding:28px 26px 22px;box-shadow:0 18px 50px rgba(0,0,0,.45)}
+  .brand{display:flex;align-items:center;gap:9px;margin-bottom:4px}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--accent);
+    box-shadow:0 0 0 4px rgba(46,163,107,.16)}
+  .brand b{font-size:17px;letter-spacing:.3px}
+  .brand span{font-size:11px;color:var(--muted);margin-left:auto}
+  p.tip{margin:2px 0 20px;color:var(--muted);font-size:12px}
+  label{display:block;font-size:12px;color:var(--muted);margin:12px 0 5px}
+  input{width:100%;padding:10px 12px;border-radius:9px;border:1px solid var(--line);
+    background:#101419;color:var(--text);font-size:14px;outline:none}
+  input:focus{border-color:#33507a;box-shadow:0 0 0 3px rgba(51,80,122,.22)}
+  button{width:100%;margin-top:20px;padding:11px;border:none;border-radius:9px;
+    background:var(--accent);color:#fff;font-size:14px;font-weight:600;cursor:pointer}
+  button:hover{background:#34b377}
+  button:disabled{opacity:.6;cursor:default}
+  .err{min-height:18px;margin-top:12px;font-size:12px;color:var(--danger)}
+  .foot{margin-top:18px;padding-top:14px;border-top:1px solid var(--line);
+    font-size:11px;color:var(--muted);line-height:1.7}
+  code{background:#101419;padding:1px 5px;border-radius:4px;color:#9fb3c8}
+</style>
+</head>
+<body>
+<form class="card" id="form" autocomplete="off">
+  <div class="brand"><i class="dot"></i><b>ProxyDog</b><span>v1.2</span></div>
+  <p class="tip">代理池控制台 · 请登录后使用</p>
+  <label>用户名</label>
+  <input id="u" name="username" value="admin" autofocus>
+  <label>密码</label>
+  <input id="p" name="password" type="password" placeholder="首次登录见 data/first-login.txt">
+  <div class="err" id="err"></div>
+  <button id="btn" type="submit">登 录</button>
+  <div class="foot">
+    忘记密码：在项目目录执行 <code>python app.py --reset-password</code><br>
+    机器调用取用接口请改用 <code>X-API-Key</code>，见面板「维护 → API Key」。
+  </div>
+</form>
+<script>
+const form = document.getElementById('form');
+const btn = document.getElementById('btn');
+const errBox = document.getElementById('err');
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  errBox.textContent = '';
+  btn.disabled = true; btn.textContent = '登录中…';
+  try{
+    const resp = await fetch('/login' + location.search, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username: document.getElementById('u').value.trim(),
+                            password: document.getElementById('p').value})
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || !data.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+    location.href = data.redirect || '/';
+  }catch(err){
+    errBox.textContent = err.message;
+    btn.disabled = false; btn.textContent = '登 录';
+  }
+});
+</script>
+</body>
+</html>

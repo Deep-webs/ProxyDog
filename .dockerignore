@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+data/
+logs/
+*.db
+*.db-wal
+*.db-shm
+_tmp_check.js
+first-login.txt

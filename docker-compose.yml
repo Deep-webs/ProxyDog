@@ -1,0 +1,21 @@
+# 一键启动：docker compose up -d --build
+# 面板 http://<服务器IP>:5002（首次登录账号 admin，密码见 data/first-login.txt）
+services:
+  proxydog:
+    build: .
+    image: proxydog:latest
+    container_name: proxydog
+    restart: unless-stopped
+    ports:
+      - "2080:2080"     # HTTP 代理
+      - "2081:2081"     # SOCKS5 代理
+      - "5002:5002"     # 管理面板
+    environment:
+      PROXYDOG_LISTEN_HOST: 0.0.0.0
+      PROXYDOG_WEB_HOST: 0.0.0.0
+      TZ: Asia/Shanghai
+      # 想在容器里强制开面板登录就打开下面两行
+      # PROXYDOG_PANEL_AUTH: "true"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
