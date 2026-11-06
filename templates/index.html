@@ -1715,7 +1715,8 @@ function row(r){
     : '<td><span style="color:var(--muted)" ' +
       'title="跑一次「验证」（开启匿名检测）即可采到出口 IP">-</span>' + kindChip + '</td>';
   return '<tr class="' + (r.is_valid ? '' : 'invalid') + '">' +
-    '<td><input type="checkbox" ' + (selected.has(r.id) ? 'checked' : '') +
+    '<td><input type="checkbox" class="ck" data-id="' + r.id + '" ' +
+      (selected.has(r.id) ? 'checked' : '') +
       ' onclick="pick(' + r.id + ',this)"></td>' +
     '<td class="num" style="color:var(--muted)">' + r.id + '</td>' +
     '<td style="cursor:pointer;text-align:center" onclick="toggleFav(' + r.id + ',' + (!r.favorite) + ')" ' +
@@ -1768,9 +1769,9 @@ function pick(id, cb){
   updateSelBar();
 }
 function toggleAll(cb){
-  document.querySelectorAll('#tbody input[type=checkbox]').forEach(x => {
+  document.querySelectorAll('#tbody input.ck').forEach(x => {
     x.checked = cb.checked;
-    const id = +x.getAttribute('onclick').match(/\d+/)[0];
+    const id = +x.dataset.id;
     cb.checked ? selected.add(id) : selected.delete(id);
   });
   updateSelBar();
