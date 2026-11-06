@@ -3327,6 +3327,7 @@ function freshDraft(){
     max_retries: s.max_retries == null ? 2 : s.max_retries,
     fail_quarantine: s.fail_quarantine || 4,
     quarantine_seconds: s.quarantine_seconds || 600,
+    revalidate_interval: s.revalidate_interval || 600,
     dedupe_exit: !!s.dedupe_exit,
     weight_health: !!s.weight_health,
     prefer_fast: s.prefer_fast !== false,
@@ -3578,7 +3579,9 @@ const CAT_RENDER = {
       sTgl('precheck_exit', '取前抢先验',
         '照 ProxyCat：把选中的出口先预检一次再交给客户端，不合格的丢掉换下一条——避免把第一次失败甩给你。开启后每次请求多一次预检，稍慢。', {}) +
       sNum('fail_quarantine', '连续失败几次进隔离', '次', null, {min:1}) +
-      sNum('quarantine_seconds', '隔离冷却', '秒', null, {min:30}) +
+      sNum('quarantine_seconds', '隔离冷却', '秒', '连续失败达到次数后先冷却这么久；之后每多失败一次，冷却时长翻倍（上限 24 小时），惯犯不会再每 10 分钟准时复活。', {min:30}) +
+      sNum('revalidate_interval', '自动重验证周期', '秒',
+        '后台定期把池内有效出口重测一遍，坏掉的尽快踢出候选。默认 600 秒；调小坏节点退场更快，但会更占验证并发。', {min:120, step:60}) +
       adv('高级：连接层参数',
         sNum('relay_buffer', '转发缓冲阈值', '字节',
           '客户端读得慢（写缓冲超过这个值）就暂停从上游读，防止内存被慢客户端吃爆。', {min:4096, step:1024}) +
@@ -3798,6 +3801,7 @@ async function submitSettings(){
     max_conn_per_exit: +d.max_conn_per_exit || 0,
     fail_quarantine: +d.fail_quarantine || 4,
     quarantine_seconds: +d.quarantine_seconds || 600,
+    revalidate_interval: +d.revalidate_interval || 600,
     max_retries: +d.max_retries || 0,
     dedupe_exit: !!d.dedupe_exit,
     weight_health: !!d.weight_health,

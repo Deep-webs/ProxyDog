@@ -280,11 +280,11 @@ class ProxyServer:
         bad = d.get("fail_count") or 0
         rate = (ok / (ok + bad)) if (ok + bad) else 0.6
         w = 0.2 + speed * max(0.15, rate) * 4.0
-        # 健康分（0~100）当乘数：90 分 ≈ 1.56，30 分 ≈ 0.72，不搞一刀切
+        # 健康分（0~100）当乘数：90 分 ≈ 1.95，30 分 ≈ 0.75，0 分 ≈ 0.15，
+        # 低分节点几乎选不中，但不搞一刀切（池子小的时候仍可用）
         if self._settings().get("health_on"):
             h = float(d.get("health") or 0)
-            if h > 0:
-                w *= 0.3 + (h / 100.0) * 1.4
+            w *= 0.15 + (h / 100.0) * 2.0
         pref = str(self._settings().get("preferred_regions") or "")
         if pref:
             region = str(d.get("region") or "").upper()

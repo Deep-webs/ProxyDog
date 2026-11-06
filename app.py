@@ -32,7 +32,7 @@ from netproxy import ProxyServer
 from store import BASE_DIR, DATA_DIR, MODE_KEYS, MODES, Store
 
 # ---------------- 版本与更新检查 ----------------
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 ABOUT = {
     "name": "ProxyDog",
     "version": VERSION,
@@ -2941,11 +2941,12 @@ async def _background():
                     except Exception as exc:
                         store.touch_api_source(src_row["id"], error=str(exc))
                         plog.warning("插件抓取失败 %s: %s", pub.get("name"), exc)
-            if now - last_revalidate > 1800:
+            rv_iv = max(120, int(s.get("revalidate_interval") or 600))
+            if now - last_revalidate > rv_iv:
                 last_revalidate = now
-                SCHED["validate"].update(last=now, next=now + 1800)
+                SCHED["validate"].update(last=now, next=now + rv_iv)
                 # 不带延迟过滤：超限的也要重测一次，否则它会永远停在「有效」却选不到
-                rows = store.candidates(0, limit=400)
+                rows = store.candidates(0, limit=600)
                 if rows:
                     _ph, _au, _kw = _validate_opts(s)
                     results = await sources.validate_many(

@@ -225,6 +225,8 @@ DEFAULTS = {
     "fail_ratio_on": True,
     "fail_window": 20,              # 窗口样本数
     "fail_ratio": 60,               # 失败占比阈值（%）
+    # ---- 自动重验证：定期把池内有效出口重测一遍，坏掉尽快踢出候选 ----
+    "revalidate_interval": 600,     # 重验证周期（秒）；太密会占满验证并发，太疏坏节点赖着不走
     # ---- 目标绕过名单（照 ProxyCat：命中的目标强制直连）----
     "bypass_list": "",
     # ---- 验证强度（照 ProxyCat 三档）----
@@ -584,7 +586,11 @@ class Store:
                         (streak, now, streak, max(1, int(invalid_after)),
                          1 if over else 0, 1 if over else 0, pid))
                 else:
-                    until = (now + max(30, int(quarantine_secs))
+                    # 升级式隔离：超过隔离线的连续失败每多一次，冷却时长翻倍
+                    # （600s → 20min → 40min → …上限 24h），惯犯不再每 10 分钟
+                    # 准时复活来污染轮换；真正临时挂掉的节点复活一次就回池
+                    mult = min(2 ** max(0, streak - max(1, int(quarantine_after))), 64)
+                    until = (now + min(86400, max(30, int(quarantine_secs)) * mult)
                              if streak >= max(1, int(quarantine_after)) else 0)
                     self._conn.execute(
                         "UPDATE proxies SET fail_count=fail_count+1, fail_streak=?, "
