@@ -69,6 +69,17 @@ SOURCES = [
      "url": "https://cdn.jsdelivr.net/gh/prxchk/proxy-list@main/http.txt"},
     {"name": "zaeem20-http", "protocol": "http", "cap": 300,
      "url": "https://cdn.jsdelivr.net/gh/Zaeem20/FREE_PROXIES_LIST@master/http.txt"},
+    # —— 三张“更新最快、头部最干净”的大表：单源量大，配合严格验证能捞出更多好节点 ——
+    {"name": "speedx-http", "protocol": "http", "cap": 2500,
+     "url": "https://cdn.jsdelivr.net/gh/TheSpeedX/PROXY-List@master/http.txt"},
+    {"name": "speedx-socks5", "protocol": "socks5", "cap": 1500,
+     "url": "https://cdn.jsdelivr.net/gh/TheSpeedX/PROXY-List@master/socks5.txt"},
+    {"name": "monosans-http", "protocol": "http", "cap": 2000,
+     "url": "https://cdn.jsdelivr.net/gh/monosans/proxy-list@main/proxies/http.txt"},
+    {"name": "monosans-socks5", "protocol": "socks5", "cap": 1200,
+     "url": "https://cdn.jsdelivr.net/gh/monosans/proxy-list@main/proxies/socks5.txt"},
+    {"name": "clarketm-http", "protocol": "http", "cap": 1500,
+     "url": "https://cdn.jsdelivr.net/gh/clarketm/proxy-list@master/proxy-list-raw.txt"},
 ]
 
 # 需要时可在设置里打开（GeoNode 接口默认关，按需开启）
@@ -504,6 +515,10 @@ async def fetch_all(max_total=6000, use_geonode=False, custom=None, only=None,
     src_list = [s for s in builtin_sources()
                 if only or s["name"] not in OVERRIDES["disabled"]]
     src_list = [s for s in src_list if not only or s["name"] == only]
+    if skip_builtin:
+        # 单抓一个测绘源时不该顺带跑几十个内置清单：那样既慢，又会把一堆
+        # 无关的免费节点灌进库，把「这个源到底抓到多少」的统计冲掉
+        src_list = []
     if not only:
         # 分国清单：把「国内 / 指定国家」落到具体的国家级清单上，命中率比全球清单高得多
         if scope == "cn":
@@ -536,7 +551,7 @@ async def fetch_all(max_total=6000, use_geonode=False, custom=None, only=None,
         # 抓取插件（plugins/*.py）：目录里丢一个文件就多一个源，热重载由 plugins 自己盯
         try:
             import plugins as _pl
-            if _pl._GLOBAL_ON:
+            if _pl._GLOBAL_ON and not skip_builtin:
                 p_rows, p_rep = await _pl.fetch_plugin_rows(session)
                 rows.extend(p_rows)
                 report.extend(p_rep)

@@ -16,7 +16,7 @@ import socket
 import threading
 import time
 import urllib.request
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from flask import (Flask, Response, g, jsonify, redirect, request,
                    send_from_directory, session)
@@ -32,7 +32,7 @@ from netproxy import ProxyServer
 from store import BASE_DIR, DATA_DIR, MODE_KEYS, MODES, Store
 
 # ---------------- 版本与更新检查 ----------------
-VERSION = "1.8.1"
+VERSION = "1.8.3"
 ABOUT = {
     "name": "ProxyDog",
     "version": VERSION,
@@ -380,19 +380,69 @@ def _rows_by_ids(ids):
     return out
 
 
+# 测试地址 -> 页面里必然出现的特征串。自己没填「校验特征串」时按这个自动取，
+# 免得用户以为「填了 baidu 就完事」，结果一半节点是被劫持页骗过去的假 200。
+_KEYWORD_BY_HOST = (
+    ("baidu.com", "百度一下"),
+    ("bing.com", "bing"),
+    ("google.", "Google"),
+    ("sogou.com", "搜狗"),
+    ("so.com", "360"),
+    ("sm.cn", "神马"),
+    ("github.com", "GitHub"),
+)
+
+
+def _auto_keyword(test_url):
+    """按测试地址猜一个内容特征串；猜不到就返回空（不做内容校验）。"""
+    try:
+        host = (urlsplit(str(test_url or "")).hostname or "").lower()
+    except ValueError:
+        return ""
+    for suffix, kw in _KEYWORD_BY_HOST:
+        if host == suffix or host.endswith("." + suffix) or host.endswith(suffix):
+            return kw
+    return ""
+
+
+def _content_keyword(s):
+    """内容校验用的特征串：优先用户自己填的，否则按测试地址自动推。"""
+    kw = str(s.get("test_keyword") or "").strip()
+    if kw:
+        return kw
+    if (s.get("test_keyword_auto") is False):
+        return ""
+    return _auto_keyword(s.get("test_url"))
+
+
 def _validate_opts(s):
     """验证强度三档（照 ProxyCat）。
 
     fast     只测 HTTP 连通，不测 HTTPS、不看匿名、不校验特征串 —— 最快、最省
     standard HTTP + HTTPS 探测，按设置决定是否验匿名，校验特征串
     strict   再加匿名强校验：代理必须能被识别为高匿，且响应必须包含特征串
+
+    特征串这一步不能省：实测同一批节点「只看 HTTP 200」能过 73%，加上内容校验
+    只剩 33%，中间那 40% 全是劫持页 / 假 200 / 运营商插页——它们进了池子就会让
+    使用者看到「明明显示有效却打不开」。
     """
     lvl = str(s.get("validate_level") or "standard").lower()
     probe_https = lvl != "fast"
     want_anon = bool(s.get("verify_anonymity")) or lvl == "strict"
     anon_url = (s.get("anon_echo_url") or "") if want_anon else ""
-    keyword = "" if lvl == "fast" else str(s.get("test_keyword") or "").strip()
+    keyword = "" if lvl == "fast" else _content_keyword(s)
     return probe_https, anon_url, keyword
+
+
+def _reval_opts(s):
+    """定期重验证专用的轻量选项：只测能不能通、多快。
+
+    匿名度与 HTTPS 支持在入库验证时已经采过一次，之后不会变；每轮重验都重复探测
+    会让每条出口多花 1~2 个请求，池子一大就验不完，节点新鲜度反而更差。
+    但内容校验要留着——不加它，被劫持的节点会一直以「有效」身份留在池子里。
+    """
+    kw = "" if str(s.get("validate_level") or "") == "fast" else _content_keyword(s)
+    return False, "", kw
 
 
 def _check_kwargs(s):
@@ -1187,6 +1237,7 @@ def api_fetch():
                 skip_builtin=not free), 600)
             if proto:
                 rows = [r for r in rows if (r.get("protocol") or "").lower() == proto]
+            rows = _drop_dead_ports(rows, s)
             busy["progress"] = f"抓取到 {len(rows)} 条，入库中"
             _added, ids = store.add_many(rows)
             _geo_fill()
@@ -1224,14 +1275,20 @@ def api_api_source_fetch(sid):
     if busy["fetching"]:
         return err("已有抓取任务在跑")
     s = store.settings()
+    # 注意：这里必须用原始配置（带 creds），不能用 _public_api_source 的脱敏结果——
+    # 那份是给前端看的，creds 被换成 creds_masked，拿去抓取会一直报「缺少 xxx key」
+    cfg = {k: row.get(k) for k in
+           ("id", "name", "provider", "target", "query", "protocol", "cap")}
+    cfg["creds"] = row.get("creds") or {}
     busy["fetching"] = True
     busy["progress"] = f"抓取源：{pub['name']}"
 
     def work():
         try:
             rows, rep = run_coro(sources.fetch_all(
-                0, False, custom=[pub], skip_builtin=True), 300)
+                0, False, custom=[cfg], skip_builtin=True), 300)
             got = sum(r.get("count", 0) for r in rep)
+            rows = _drop_dead_ports(rows, s)
             busy["progress"] = f"「{pub['name']}」抓到 {got} 条，入库中"
             _added, ids = store.add_many(rows)
             _geo_fill()
@@ -1271,6 +1328,7 @@ def api_fetch_source():
             rows, _rep = run_coro(sources.fetch_all(
                 int(s["max_fetch_total"]), False, None, only=name,
                 scope=s.get("fetch_scope") or "all", countries=_scope_countries(s)), 300)
+            rows = _drop_dead_ports(rows, s)
             busy["progress"] = f"「{name}」抓到 {len(rows)} 条，入库中"
             _added, ids = store.add_many(rows)
             _geo_fill()
@@ -1338,6 +1396,28 @@ def _scope_countries(s):
             if c.strip()]
 
 
+def _drop_dead_ports(rows, s=None):
+    """抓回来的候选先过一遍「死端口黑名单」，省下验证名额。
+
+    只跳过样本足够多（>=80 次）且从没成功过的端口——样本少的端口不动，
+    免得一个偶然运气不好的好端口被误杀。
+    """
+    if not rows:
+        return rows
+    try:
+        bad = store.dead_ports(150)
+    except Exception:
+        return rows
+    if not bad:
+        return rows
+    kept = [r for r in rows if int(r.get("port") or 0) not in bad]
+    dropped = len(rows) - len(kept)
+    if dropped:
+        log.info("跳过死端口候选 %s 条（端口 %s）", dropped,
+                 ",".join(str(p) for p in sorted(bad)[:6]))
+    return kept
+
+
 def _merge_custom_report(report):
     """把每个自定义源的抓取结果写回库（面板显示「上次抓到 N 条 / 报错」）。"""
     for r in report or []:
@@ -1392,7 +1472,9 @@ def api_apisources():
         "name": name, "provider": provider, "target": target,
         "query": query,
         "protocol": data.get("protocol") or "http",
-        "creds": creds, "cap": data.get("cap") or 300, "enabled": True,
+        "creds": creds,
+        "cap": data.get("cap") or 300,
+        "enabled": True,
     })
     log.info("新增自定义源: %s (%s)", name, provider)
     return ok(id=sid, name=name)
@@ -2431,6 +2513,7 @@ def _auto_scale_once(s=None, force=False, reason=""):
                 scope=s.get("fetch_scope") or "all",
                 countries=_scope_countries(s)), 600)
             _merge_custom_report(rep)
+            rows = _drop_dead_ports(rows, s)
             tasks.update(tid, total=max(1, len(rows)))
             _n, ids = store.add_many(rows)
             tasks.update(tid, done=max(1, len(rows)))
@@ -2865,6 +2948,7 @@ async def _background():
                                                      scope=s.get("fetch_scope") or "all",
                                                      countries=_scope_countries(s))
                 _merge_custom_report(_rep)
+                rows = _drop_dead_ports(rows, s)
                 _n, ids = store.add_many(rows)
                 if ids:
                     _geo_fill()
@@ -2921,9 +3005,15 @@ async def _background():
                     if now - last_run < iv * 60:
                         continue
                     try:
+                        # 同样要用带 creds 的原始配置，脱敏版抓不了
+                        one = {k: src_row.get(k) for k in
+                               ("id", "name", "provider", "target", "query",
+                                "protocol", "cap")}
+                        one["creds"] = src_row.get("creds") or {}
                         rows, rep = await sources.fetch_all(
-                            0, False, custom=[pub], skip_builtin=True)
+                            0, False, custom=[one], skip_builtin=True)
                         _merge_custom_report(rep)
+                        rows = _drop_dead_ports(rows, s)
                         _added, ids = store.add_many(rows)
                         if ids:
                             _geo_fill()
@@ -2945,10 +3035,11 @@ async def _background():
             if now - last_revalidate > rv_iv:
                 last_revalidate = now
                 SCHED["validate"].update(last=now, next=now + rv_iv)
-                # 不带延迟过滤：超限的也要重测一次，否则它会永远停在「有效」却选不到
-                rows = store.candidates(0, limit=600)
+                # 不带延迟过滤：超限的也要重测一次，否则它会永远停在「有效」却选不到；
+                # 取「最久没验」的，保证全池都能轮到，而不是反复验最快的那几条
+                rows = store.stale_rows(limit=600)
                 if rows:
-                    _ph, _au, _kw = _validate_opts(s)
+                    _ph, _au, _kw = _reval_opts(s)
                     results = await sources.validate_many(
                         [(r["id"], r) for r in rows], s["test_url"],
                         int(s["validate_timeout"]), int(s["validate_concurrency"]),
@@ -2964,7 +3055,7 @@ async def _background():
                 # 池子只能靠不停抓新的来续命（免费源经常抓不到）
                 dead = store.invalid_rows(limit=150)
                 if dead:
-                    _ph, _au, _kw = _validate_opts(s)
+                    _ph, _au, _kw = _reval_opts(s)
                     res = await sources.validate_many(
                         [(r["id"], r) for r in dead], s["test_url"],
                         int(s["validate_timeout"]), int(s["validate_concurrency"]),
@@ -3012,11 +3103,21 @@ async def _background():
                     log.info("场景验证: %s 条，失败 %s（url=%s kw=%s）",
                              len(results), bad, url, kw or "-")
             # 慢节点不留在池子里：上限调低后旧数据也能在一个周期内自动清掉
-            if s.get("auto_drop_slow") and now - last_sweep > 600:
+            if now - last_sweep > 600:
                 last_sweep = now
-                gone = store.purge_slow(int(s.get("max_delay_ms") or 0), only_marked=True)
-                if gone:
-                    log.info("清理超延迟出口: %s 条", gone)
+                if s.get("auto_drop_slow"):
+                    gone = store.purge_slow(int(s.get("max_delay_ms") or 0),
+                                            only_marked=True)
+                    if gone:
+                        log.info("清理超延迟出口: %s 条", gone)
+                # 从没成功过的死条目：不清理的话每次抓取的几千条垃圾会一直堆在库里，
+                # 统计失真、自动扩容判断也跟着失真
+                keep_h = int(s.get("dead_purge_hours") or 0)
+                if keep_h > 0:
+                    junk = store.purge_never_worked(keep_h, limit=5000)
+                    if junk:
+                        log.info("清理从未成功的死条目: %s 条（保留最近 %s 小时）",
+                                 junk, keep_h)
             if now - last_prune > 86400:
                 last_prune = now
                 deleted = store.prune_logs(int(s.get("access_log_days") or 7))

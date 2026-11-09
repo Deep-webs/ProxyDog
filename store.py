@@ -148,7 +148,7 @@ DEFAULTS = {
     # 延迟优先：只在“最快的一批”出口里挑（最快值 + 窗口 ms，且不超过池子的前 25%），
     # 避免总用同一条被打爆，同时基本不碰慢节点
     "prefer_fast": True,
-    "fast_window_ms": 500,
+    "fast_window_ms": 300,
     # 无限模式（无限轮询）：轮换范围扩大到整个有效池，从延时最小开始依次轮流、循环往复
     "infinite_mode": False,
     # 场景模式：验证网站（空 = 用上面的 test_url），每 2 分钟验证一次，失败即换
@@ -175,15 +175,19 @@ DEFAULTS = {
     "token": "",
     # 验证
     "test_url": "https://www.baidu.com",
-    # 验证时响应体必须包含的字符串（空=只看状态码；防"能通但被劫持"）
+    # 验证时响应体必须包含的字符串（空=按测试地址自动推，例如 baidu -> 百度一下）
     "test_keyword": "",
-    "validate_concurrency": 80,
-    "validate_timeout": 8,
+    # 自动推特征串的总开关：关掉后 test_keyword 为空就真的只看状态码
+    "test_keyword_auto": True,
+    "validate_concurrency": 160,          # 并发验证：免费池 95% 是死的，串行验根本追不上节点死亡速度
+    "validate_timeout": 5,
     "validate_on_add": True,
     # 延迟上限：超过这条线的出口不进候选池，验证后直接判为不可用
-    "max_delay_ms": 3000,
+    "max_delay_ms": 2000,
     # 验证结束后直接删掉超延迟的条目，而不是留在列表里占位
     "auto_drop_slow": True,
+    # 清理「从没成功过」的死条目：保留小时数（0=只保留，不自动删）
+    "dead_purge_hours": 2,
     "drop_transparent": False,
     # 抓取
     "auto_fetch": False,
@@ -223,10 +227,10 @@ DEFAULTS = {
     "source_remote_interval": 5,    # remote：刷新间隔（分钟）
     # ---- 失败占比淘汰（照 ProxyCat：看滑动窗口失败占比，而不是连续失败次数）----
     "fail_ratio_on": True,
-    "fail_window": 20,              # 窗口样本数
-    "fail_ratio": 60,               # 失败占比阈值（%）
+    "fail_window": 15,              # 窗口样本数
+    "fail_ratio": 50,               # 失败占比阈值（%）
     # ---- 自动重验证：定期把池内有效出口重测一遍，坏掉尽快踢出候选 ----
-    "revalidate_interval": 600,     # 重验证周期（秒）；太密会占满验证并发，太疏坏节点赖着不走
+    "revalidate_interval": 300,     # 重验证周期（秒）：免费节点“半小时新鲜度”根本不够，5 分钟一轮
     # ---- 目标绕过名单（照 ProxyCat：命中的目标强制直连）----
     "bypass_list": "",
     # ---- 验证强度（照 ProxyCat 三档）----
@@ -237,7 +241,9 @@ DEFAULTS = {
     # ---- 全局并发与池空等待（照 ProxyCat）----
     "max_conns_global": 3000,       # 全局并发上限，超出排队等待；0=不限
     "wait_pool_seconds": 30,        # 池空时持续补货等待的秒数，超时才报错；0=不等待
-    "precheck_exit": False,         # 取前抢先验：把选中的出口先预检一次再交给客户端
+    "precheck_exit": True,          # 取前抢先验：把选中的出口先预检一次再交给客户端（智能版：只检不新鲜的）
+    "precheck_fresh": 60,           # 预检新鲜期（秒）：一分钟内拨通过的出口才免检
+    "dial_timeout": 5,              # 拨号超时（秒）：免费出口建连慢的直接淘汰
     # ---- 检测节流三参数（照 ProxyCat）----
     "check_cache_seconds": 30,      # 检测结果缓存：缓存期内不重复发请求
     "check_min_interval": 5,        # 同一出口两次检测的最小间隔（秒）
@@ -272,7 +278,7 @@ DEFAULTS = {
     "lang": "zh",                   # zh / en
     # ---- 出口健康分 ----
     "health_on": True,              # 计算健康分并参与轮换权重
-    "health_min": 0,                # 低于该分数的出口不参与轮换（0=不设下限）
+    "health_min": 20,               # 低于该分数的出口不参与轮换（0=不设下限；全不达标时回退整池）
     "health_window": 200,           # 计算成功率用的最近访问记录条数
     # ---- 自动扩容（池子不够就自己补货）----
     "auto_scale": True,
@@ -387,6 +393,10 @@ class Store:
             self._conn.execute("PRAGMA wal_autocheckpoint=256")
             self._migrate()
             self._conn.commit()
+            try:
+                self._tune_quality()
+            except sqlite3.Error:
+                pass
 
     def _migrate(self):
         """给老库补列。SQLite 的 ALTER TABLE 没有 IF NOT EXISTS，只能先查表结构。"""
@@ -400,6 +410,52 @@ class Store:
                     pass
 
     # ---------------- 设置 ----------------
+    def _tune_quality(self):
+        """v1.8.1 一次性质量调参（老库升级时执行一次）。
+
+        只调那些还停在上一个默认值上的项，用户自己调过的保持原样；调完写标记，
+        以后不再动。想恢复宽松可以随时在设置页改回去。
+        """
+        cur = self.settings()
+        try:
+            done = self._conn.execute(
+                "SELECT v FROM settings WHERE k='quality_tuned_v181'").fetchone()
+        except sqlite3.Error:
+            done = None
+        if done and str(done["v"]) == "1":
+            return
+        want = {}
+        if int(cur.get("max_delay_ms") or 0) >= 3000:
+            want["max_delay_ms"] = 2000        # 3 秒的出口实际体验就是“卡”
+        if int(cur.get("health_min") or 0) == 0:
+            want["health_min"] = 20            # 低分节点退出轮换（全不达标仍回退整池）
+        if not cur.get("precheck_exit"):
+            want["precheck_exit"] = True       # 智能预检：只检不新鲜的出口
+        if int(cur.get("fast_window_ms") or 0) >= 500:
+            want["fast_window_ms"] = 300
+        if int(cur.get("fail_ratio") or 0) >= 60:
+            want["fail_ratio"] = 50            # 失败占比过半就下场
+        if int(cur.get("fail_window") or 0) >= 20:
+            want["fail_window"] = 15
+        if int(cur.get("revalidate_interval") or 0) >= 600:
+            want["revalidate_interval"] = 300
+        if int(cur.get("precheck_fresh") or 0) >= 90:
+            want["precheck_fresh"] = 60
+        if int(cur.get("validate_concurrency") or 0) < 120:
+            want["validate_concurrency"] = 160
+        if int(cur.get("validate_timeout") or 0) > 5:
+            want["validate_timeout"] = 5
+        for k, v in want.items():
+            self._conn.execute(
+                "INSERT INTO settings(k, v) VALUES(?, ?) "
+                "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                (k, "true" if v is True else str(v)))
+        self._conn.execute(
+            "INSERT INTO settings(k, v) VALUES('quality_tuned_v181', '1') "
+            "ON CONFLICT(k) DO UPDATE SET v='1'")
+        self._conn.commit()
+        self.version += 1
+
     def settings(self):
         out = dict(DEFAULTS)
         with self._lock:
@@ -759,6 +815,24 @@ class Store:
             self.version += 1
         return len(ids)
 
+    def stale_rows(self, limit=600, max_delay_ms=0):
+        """「最久没验过」的有效出口：定期重验证用。
+
+        以前用 candidates() 取，它按延迟升序——结果每轮都在验最快的那几条，
+        慢的、放久了的永远排不上队，池子里就攒着一堆「看起来有效、其实早死了」
+        的节点，这正是池子越大越不好用的原因。改成按 last_check 升序轮一遍。
+        """
+        sql = "SELECT * FROM proxies WHERE enabled=1 AND is_valid=1"
+        vals = []
+        if max_delay_ms:
+            sql += " AND (delay_ms IS NULL OR delay_ms<=?)"
+            vals.append(int(max_delay_ms))
+        sql += " ORDER BY COALESCE(last_check,0) ASC LIMIT ?"
+        vals.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(sql, vals).fetchall()
+        return [dict(r) for r in rows]
+
     def invalid_rows(self, limit=300):
         """失效但还启用着的出口：池空自愈时用。
 
@@ -877,6 +951,50 @@ class Store:
             self._conn.commit()
         self.version += 1
         return cur.rowcount
+
+    def purge_never_worked(self, hours=4, limit=5000):
+        """删掉从来没成功过一次、且最后一次验证已过去 N 小时的条目。
+
+        免费池每次抓取都是几千条候选，绝大多数一次都连不上。它们会以
+        is_valid=0 / fail_count=1 的身份永远躺在库里——cleanup() 只删
+        fail_count>=3 的，于是一天下來库能涨到上万条死数据：统计被稀释、
+        自动扩容判断失真、备份也变大。这里按「从没成功过 + 已经放了几小时」
+        直接清掉，跟无影的「删除无效代理」是一个意思。
+        """
+        cutoff = time.time() - max(1, int(hours)) * 3600
+        sql = ("DELETE FROM proxies WHERE id IN (SELECT id FROM proxies "
+               "WHERE is_valid=0 AND success_count=0 AND fail_count>=1 "
+               "AND COALESCE(last_check, created_at, 0)<? LIMIT ?)")
+        with self._lock:
+            cur = self._conn.execute(sql, (cutoff, max(1, int(limit))))
+            self._conn.commit()
+        if cur.rowcount:
+            self.version += 1
+        return cur.rowcount
+
+    # 常见代理端口：就算历史样本一次没成功，也不能进黑名单——这些端口上
+    # 真代理很多，0 成功更可能是「样本本身都是公开清单里的死节点」造成的。
+    COMMON_PROXY_PORTS = {
+        22, 53, 80, 443, 1080, 1081, 1087, 3128, 3129, 4145, 7070, 8000, 8001,
+        8008, 8080, 8081, 8085, 8118, 8888, 8889, 9000, 9090, 9999,
+        10808, 10809, 10811, 7890, 7891, 7892, 3000, 5000, 6000,
+    }
+
+    def dead_ports(self, min_samples=150, limit=30):
+        """返回「样本足够多、却一次都没成功过」的非主流端口集合。
+
+        Quake / FOFA 这类测绘数据里，很多端口是批量部署的假代理（6363、49667、
+        9444 这类），一次都连不通，却占掉几百个验证名额。命中率数据本来就在库里，
+        直接拿来做黑名单。但 80 / 443 / 8080 这些常见代理端口不参与判断——
+        它们 0 成功通常是因为历史样本来自公开清单（几乎全是死的），而不是端口本身有问题。
+        """
+        sql = ("SELECT port, COUNT(*) n, SUM(CASE WHEN is_valid=1 THEN 1 ELSE 0 END) ok "
+               "FROM proxies GROUP BY port HAVING n>=? AND ok=0 ORDER BY n DESC LIMIT ?")
+        with self._lock:
+            rows = self._conn.execute(sql, (max(10, int(min_samples)),
+                                            max(1, int(limit)))).fetchall()
+        return {int(r["port"]) for r in rows
+                if r["port"] and int(r["port"]) not in self.COMMON_PROXY_PORTS}
 
     def purge_slow(self, max_delay_ms=0, only_marked=False):
         """删掉超过延迟上限的条目（能通也不留，太慢没有使用价值）。

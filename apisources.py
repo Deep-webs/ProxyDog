@@ -16,6 +16,7 @@ import base64
 import datetime
 import json
 import math
+import random
 import re
 from urllib.parse import quote, urlsplit
 
@@ -47,27 +48,47 @@ PROVIDERS = {
         "desc": "fofa.info 空间测绘，用 base64 查询语法搜代理特征",
         "creds": ["key"],
         "optional_creds": ["email"],
-        "sample": 'protocol="http" && (header="Proxy-Agent" || body="Proxy")',
-        "hint": "新账号只用 key 即可；老账号若报「email 不能为空」再补上邮箱。免费账号每次 100 条",
+        "sample": 'protocol=="socks5" && country="CN" && banner="Method:No Authentication"',
+        "hint": "新账号只用 key 即可；老账号若报「email 不能为空」再补上邮箱。"
+                "免费账号条数少且 IP 打码，会员账号才能拿到完整地址",
         "console": "https://fofa.info/userInfo",
+        "presets": [
+            ["国内 SOCKS5 免认证", 'protocol=="socks5" && country="CN" && banner="Method:No Authentication"'],
+            ["国内 HTTP 代理", 'protocol=="http" && country="CN"'],
+            ["代理特征页", 'protocol="http" && (header="Proxy-Agent" || body="Proxy")'],
+            ["SOCKS5（不限地区）", 'protocol=="socks5"'],
+        ],
     },
     "hunter": {
         "label": "鹰图 Hunter",
         "kind": "api",
         "desc": "hunter.qianxin.com 奇安信空间测绘",
         "creds": ["key"],
-        "sample": 'protocol=="http" && web.body="Proxy"',
-        "hint": "每页 20 条，消耗积分；时间窗口默认最近 30 天",
+        "sample": 'protocol=="socks5"&&protocol.banner="No authentication"&&ip.country="CN"',
+        "hint": "每页 20 条，消耗积分；查询语法与 FOFA 相近但字段名不同（见推荐语法）",
         "console": "https://hunter.qianxin.com/home/userInfo",
+        "presets": [
+            ["国内 SOCKS5 免认证", 'protocol=="socks5"&&protocol.banner="No authentication"&&ip.country="CN"'],
+            ["国内 SOCKS5", 'protocol=="socks5"&&ip.country="CN"'],
+            ["代理特征页", 'protocol=="http" && web.body="Proxy"'],
+            ["SOCKS5（不限地区）", 'protocol=="socks5"'],
+        ],
     },
     "quake": {
         "label": "Quake 360",
         "kind": "api",
         "desc": "quake.360.net 网络空间测绘",
         "creds": ["key"],
-        "sample": 'response:"Proxy-Agent"',
-        "hint": "单次最多 500 条，免费账号有额度限制",
+        "sample": 'service:socks5 AND country:"CN" AND response:"No authentication"',
+        "hint": "单次最多 500 条，按次消耗积分；语法是 Quake 自己的表达式（service:/country:/response:）",
         "console": "https://quake.360.net/quake/#/personalInfo",
+        "presets": [
+            ["国内 SOCKS5 免认证", 'service:socks5 AND country:"CN" AND response:"No authentication"'],
+            ["国内 SOCKS5", 'service:socks5 AND country:"CN"'],
+            ["国内 HTTP 代理", 'service:http AND country:"CN"'],
+            ["代理特征头", 'response:"Proxy-Agent"'],
+            ["SOCKS4", 'service:socks4'],
+        ],
     },
     "shodan": {
         "label": "Shodan",
@@ -160,11 +181,65 @@ def _apply_auto(rows, cfg, known_proto):
 def _row(host, port, proto, source):
     if not host or not port:
         return None
+    host = str(host).strip("[]")
+    if "*" in host or host in ("0.0.0.0", "127.0.0.1", "localhost"):
+        return None                 # 打码 IP / 本机回环：抓回来也用不了
     proto = _norm_proto(proto) or "http"
     if proto not in SUPPORTED:
         return None
-    return {"host": str(host).strip("[]"), "port": int(port), "protocol": proto,
+    return {"host": host, "port": int(port), "protocol": proto,
             "username": "", "password": "", "source": source}
+
+
+# 有些平台（Quake 免费/普通账号）把 ip 字段打成 14.*.*.*，但 id 是
+# "14.29.228.23_1024_tcp"，真 IP 和端口就在里面——不打码的字段反而被忽略了。
+_QUAKE_ID = re.compile(r"^(?P<ip>\d{1,3}(?:\.\d{1,3}){3})_(?P<port>\d+)")
+
+
+def _quake_addr(item):
+    """从 Quake 结果里取真实 IP:端口；打码时回退解析 id 字段。"""
+    ip = str(item.get("ip") or "").strip()
+    port = item.get("port") or 0
+    if "*" in ip or not ip:
+        m = _QUAKE_ID.match(str(item.get("id") or "").strip())
+        if m:
+            ip = m.group("ip")
+            if not port:
+                port = m.group("port")
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return "", 0
+    if not 1 <= port <= 65535:
+        return "", 0
+    return ip, port
+
+
+# SOCKS5 握手响应里的认证方式：0x0 = 免认证，0x2 = 要用户名密码。
+# 要密码的节点对我们毫无用处，抓进来只会白占验证额度。
+_AUTH_HINTS = ("username/password", "0x2 ", "0x02", "auth method: 0x2")
+_NOAUTH_HINTS = ("no authentication", "no auth", "0x0 ", "0x00", "无需认证", "免认证")
+
+
+def _socks5_needs_auth(text):
+    """True=明确要求认证，False=明确免认证或判断不出（判断不出就不拦）。"""
+    t = str(text or "").lower()
+    if not t:
+        return False
+    if any(h in t for h in _NOAUTH_HINTS):
+        return False
+    return any(h in t for h in _AUTH_HINTS)
+
+
+def _dedupe(rows):
+    seen, out = set(), []
+    for r in rows:
+        key = (r["host"], r["port"], r["protocol"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
 
 
 def _expand(host, port, proto_hint, cfg):
@@ -394,6 +469,12 @@ async def fetch_fofa(session, cfg):
             break
         if data.get("error"):
             msg = data.get("errmsg") or "FOFA 返回错误"
+            low = msg.lower()
+            if "余额" in msg or "f点" in low or "insufficient" in low:
+                msg = ("FOFA 账号 F 点余额不足（" + msg + "）——到 fofa.info 充值会员后"
+                       "才能查询；免费额度用完后接口会直接拒答")
+            elif "权限" in msg or "permission" in low or "会员" in msg:
+                msg = msg + "（该字段/语法需要会员权限）"
             # 免费账号不允许 protocol 字段：降级为只取 host 再试一次
             if "field" in msg.lower() and "protocol" in params["fields"]:
                 params["fields"] = "host"
@@ -434,87 +515,160 @@ async def fetch_fofa(session, cfg):
 
 # ── 鹰图 Hunter ───────────────────────────────────────────────────────────
 async def fetch_hunter(session, cfg):
+    """Hunter：接口域名是 hunter.qianxin.com（不是 .net），search 参数必须是
+    base64(urlencode(语法)) —— 少一层 urlencode 就会一直返回「参数错误」。
+    """
     creds = cfg.get("creds") or {}
     if _need(creds, "key"):
         return [], "缺少 Hunter key"
-    query = (cfg.get("query") or "").strip() or 'protocol=="http" && web.body="Proxy"'
+    query = (cfg.get("query") or "").strip() or \
+        'protocol=="socks5"&&protocol.banner="No authentication"&&ip.country="CN"'
     cap = max(1, int(cfg.get("cap") or 300))
-    search = base64.urlsafe_b64encode(query.encode()).decode().rstrip("=")
+    search = base64.urlsafe_b64encode(quote(query).encode()).decode().rstrip("=")
     today = datetime.date.today()
     start = (today - datetime.timedelta(days=29)).isoformat()
     end = today.isoformat()
     rows, page = [], 1
-    pages = min(10, math.ceil(cap / 20))
+    pages = min(20, math.ceil(cap / 20))
+    total = None
     while page <= pages:
         params = {"api-key": str(creds["key"]).strip(), "search": search,
                   "page": page, "page_size": 20, "is_web": 3,
                   "start_time": start, "end_time": end}
         try:
-            data = await _get_json(session, "https://hunter.qianxin.com/openApi/search", params)
+            data = await _get_json(session, "https://hunter.qianxin.com/openApi/search",
+                                   params)
         except RuntimeError as exc:
             if page == 1:
                 return rows, str(exc)
             break
-        if int(data.get("code") or 0) != 200:
-            msg = data.get("message") or f"Hunter code={data.get('code')}"
+        code = int(data.get("code") or 0)
+        if code != 200:
+            msg = data.get("message") or f"Hunter code={code}"
+            if code in (401, 403):
+                msg = f"{msg}（key 无效或账号未实名/无积分）"
             if page == 1:
                 return rows, msg
             break
-        arr = ((data.get("data") or {}).get("arr")) or []
+        body = data.get("data") or {}
+        if total is None:
+            total = body.get("total")
+        arr = body.get("arr") or []
         if not arr:
             break
         for item in arr:
-            host = item.get("ip") or ""
-            port = item.get("port") or 0
-            try:
-                port = int(port)
-            except (TypeError, ValueError):
+            host = str(item.get("ip") or "").strip()
+            if "*" in host:
                 continue
+            port = item.get("port") or 0
             rows.extend(_expand(host, port, item.get("protocol"), cfg))
         page += 1
         await asyncio.sleep(1.0)          # 积分敏感，别打太快
-    return rows[:cap * 2], ""
+    if not rows and not total:
+        return [], ("Hunter 返回 0 条：账号没有积分/未实名，或这条语法在最近 30 天"
+                    "没有结果。换「国内 SOCKS5」这类宽一点的语法再看")
+    return _dedupe(rows)[:cap], ""
 
 
 # ── Quake 360 ─────────────────────────────────────────────────────────────
+QUAKE_API = "https://quake.360.net/api/v3/search/quake_service"
+# 免费 / 普通账号只能翻到第 1000 条左右，再往后接口报 q2001
+# 「网页查询最大允许查询100条数据」——这条报错文不对题，实际是「深度超限」。
+QUAKE_DEPTH = 900
+
+
+async def _quake_page(session, key, payload, tries=4):
+    """取一页 Quake 数据，自己处理限流。
+
+    Quake 的限流有两种面孔：code="q3005" 的显式报错，和「code=0 但 data 为空」
+    的软限流。两种都要等一下重试，否则一次限流就会让整次抓取变空。
+    """
+    last = ""
+    for attempt in range(tries):
+        try:
+            data = await _post_json(session, QUAKE_API, payload,
+                                    headers={"X-QuakeToken": key})
+        except RuntimeError as exc:
+            last = str(exc)
+            await asyncio.sleep(3 + attempt * 3)
+            continue
+        code = str(data.get("code") or "").strip()
+        msg = data.get("message") or ""
+        if code and code != "0":
+            last = msg or f"Quake code={code}"
+            if code == "q3005" or "频繁" in msg:
+                await asyncio.sleep(5 + attempt * 5)
+                continue
+            if code == "q2001" or "最大允许查询" in msg:
+                return None, "depth"          # 翻到底了，不是错误
+            return None, last                      # 权限 / 积分类错误：重试无意义
+        items = data.get("data") or []
+        if not items:
+            last = "Quake 返回空结果（多半是被限流了）"
+            await asyncio.sleep(5 + attempt * 5)
+            continue
+        return items, ""
+    return None, last
+
+
 async def fetch_quake(session, cfg):
+    """Quake：返回百万级国内代理候选，是本池最稳定的「新鲜血液」来源。
+
+    三个坑必须处理，否则抓回来一条都用不了：
+    1. 普通/免费账号的 ip 字段是打码的（14.*.*.*），但 id 是 "14.29.228.23_1024_tcp"，
+       真地址就在里面——不解析 id 就等于抓到一堆星号；
+    2. 结果里混着「要用户名密码」的 SOCKS5（握手响应 Accepted Auth Method: 0x2），
+       这种节点永远用不了，进来只会白白吃掉验证并发，抓的时候就丢掉；
+    3. 限流极紧（几秒一次），必须放慢节奏 + 自动退避，否则一直抓到空页。
+    """
     creds = cfg.get("creds") or {}
     if _need(creds, "key"):
         return [], "缺少 Quake key"
-    query = (cfg.get("query") or "").strip() or 'response:"Proxy-Agent"'
-    cap = max(1, int(cfg.get("cap") or 300))
-    rows, start = [], 0
-    while len(rows) < cap and start < 1000:
-        size = min(100, cap - len(rows))
-        payload = {"query": query, "start": start, "size": size, "ignore_cache": False}
-        try:
-            data = await _post_json(
-                session, "https://quake.360.net/api/v3/search/quake_service", payload,
-                headers={"X-QuakeToken": str(creds["key"]).strip()})
-        except RuntimeError as exc:
-            if start == 0:
-                return rows, str(exc)
-            break
-        if int(data.get("code") or 0) != 0:
-            msg = data.get("message") or f"Quake code={data.get('code')}"
-            if start == 0:
-                return rows, msg
-            break
-        items = data.get("data") or []
-        if not items:
+    key = str(creds["key"]).strip()
+    query = (cfg.get("query") or "").strip() or \
+        'service:socks5 AND country:"CN" AND response:"No authentication"'
+    cap = max(1, int(cfg.get("cap") or 600))
+    # 每次从不同位置起手：Quake 按时间倒序返回，总拿前几页会永远抓到同一批
+    # （比如清一色的阿里云 9444 段），随机起点能让候选池一直有新面孔。
+    start = random.randrange(0, 500) if cap >= 150 else 0
+    end_at = min(start + 6000, QUAKE_DEPTH)
+    rows, skipped, seen, err = [], 0, set(), ""
+    while len(rows) < cap and start < end_at:
+        size = min(100, cap - len(rows) + 20, end_at - start)
+        items, err = await _quake_page(session, key, {
+            "query": query, "start": start, "size": size, "ignore_cache": False})
+        if items is None:
+            if rows:
+                err = ""            # 已经有货了，把这一页的失败当噪声
+            elif err == "depth":
+                err = ("Quake 账号只能翻到第 1000 条结果（q2001）。把单源上限降到 "
+                       "900 以内即可，或多配几条不同语法换着抓")
             break
         for item in items:
-            host = item.get("ip") or (item.get("location") or {}).get("ip")
-            try:
-                port = int(item.get("port") or 0)
-            except (TypeError, ValueError):
+            host, port = _quake_addr(item)
+            if not host:
+                skipped += 1
                 continue
             svc = item.get("service") or {}
             hint = svc.get("name") if isinstance(svc, dict) else ""
-            rows.extend(_expand(host, port, hint, cfg))
+            if _norm_proto(hint or "") == "socks5" and \
+                    _socks5_needs_auth((svc or {}).get("response")):
+                skipped += 1        # 要密码的 SOCKS5：抓了也用不了
+                continue
+            for r in _expand(host, port, hint, cfg):
+                k = (r["host"], r["port"], r["protocol"])
+                if k in seen:
+                    continue
+                seen.add(k)
+                rows.append(r)
+                if len(rows) >= cap:
+                    break
         start += len(items)
-        await asyncio.sleep(0.6)
-    return rows[:cap * 2], ""
+        await asyncio.sleep(2.0)    # Quake 限流很紧，宁可慢一点
+    note = f"（跳过 {skipped} 条打码/需认证）" if skipped else ""
+    if not rows:
+        return [], (err or "没有解析到可用地址") + note + "；换个查询语法或稍后再试"
+    return _dedupe(rows)[:cap], note
 
 
 # ── Shodan ────────────────────────────────────────────────────────────────
@@ -626,7 +780,7 @@ async def fetch_source(session, cfg):
         return [], f"{exc.__class__.__name__}: {str(exc)[:120]}"
     for r in rows:
         r["source"] = name
-    return rows, err or ""
+    return _dedupe(rows), err or ""
 
 
 async def fetch_custom(session, sources):

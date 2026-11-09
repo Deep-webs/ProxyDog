@@ -2420,37 +2420,33 @@ function renderProvCards(){
   }).join('');
 }
 
-async function fetchApiSource(id){
-  const row = API_ROWS.find(r => r.id === id) || {};
-  try{
-    await api('/api/apisources/' + id + '/fetch', {method:'POST',
-      headers:{'Content-Type':'application/json'}, body:'{}'});
-    toast('「' + esc(row.name || '') + '」已开始抓取，入库后自动验证');
-    poll(60000);
-  }catch(e){ toast(e.message, true); }
-}
-
-/* 常用查询语法：只收录实测能返回结果的（2026-11-06 用真实 key 逐条验证）。
-   未验证的平台不预置；textarea 可自由改写，自定义语法照常使用。 */
+/* 常用查询语法：优先后端 PROVIDERS 里带的 presets（含「无影」那套免认证语法），
+   后端没给才用本地兜底。textarea 可自由改写，自定义语法照常使用。 */
 const QUERY_PRESETS = {
   hunter: [
+    ['国内 SOCKS5 免认证', 'protocol=="socks5"&&protocol.banner="No authentication"&&ip.country="CN"'],
     ['代理特征页', 'protocol=="http" && web.body="Proxy"'],
     ['SOCKS5', 'protocol=="socks5"'],
-    ['HTTP', 'protocol=="http"'],
-    ['SOCKS4', 'protocol=="socks4"'],
-    ['Proxy-Agent 头', 'header="Proxy-Agent"'],
-    ['页面含 Proxy', 'web.body="Proxy"'],
-    ['页面含 socks', 'protocol=="http" && web.body="socks"']
+    ['HTTP', 'protocol=="http"']
   ],
   quake: [
+    ['国内 SOCKS5 免认证', 'service:socks5 AND country:"CN" AND response:"No authentication"'],
+    ['国内 SOCKS5', 'service:socks5 AND country:"CN"'],
     ['代理特征头', 'response:"Proxy-Agent"'],
-    ['SOCKS5', 'service:socks5'],
-    ['国内 SOCKS5', 'service:socks5 AND country: "CN"'],
-    ['HTTP 代理', 'service:http AND response:"Proxy-Agent"'],
-    ['SOCKS4', 'service:socks4'],
-    ['MikroTik SOCKS5', 'response:"MikroTik" AND service:socks5']
+    ['HTTP 代理', 'service:http AND country:"CN"']
+  ],
+  fofa: [
+    ['国内 SOCKS5 免认证', 'protocol=="socks5" && country="CN" && banner="Method:No Authentication"'],
+    ['代理特征页', 'protocol="http" && (header="Proxy-Agent" || body="Proxy")'],
+    ['SOCKS5', 'protocol=="socks5"']
   ]
 };
+
+/* 取某个平台可点的语法：后端 presets 优先，其次本地表 */
+function queryPresets(provider){
+  const meta = API_PROVIDERS[provider] || {};
+  return (meta.presets && meta.presets.length) ? meta.presets : (QUERY_PRESETS[provider] || []);
+}
 
 function renderPresets(){
   const have = new Set(API_ROWS.map(r => (r.target || '').toLowerCase()));
@@ -2535,10 +2531,10 @@ function apiFormFields(provider, row){
   let h = '<div class="field"><label>查询语法（key 在下面填；语法留空则用推荐语句）</label>' +
     '<textarea id="aQuery" rows="3" placeholder="' + esc(meta.sample || '') + '">' +
     esc((row && row.query) || meta.sample || '') + '</textarea>' +
-    ((QUERY_PRESETS[provider] || []).length
+    (queryPresets(provider).length
       ? '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;align-items:center">' +
         '<span class="hint" style="margin:0">常用语法（实测可用，点击填入）：</span>' +
-        QUERY_PRESETS[provider].map(p =>
+        queryPresets(provider).map(p =>
           '<span class="qchip" onclick="fillQuery(this)" data-q="' + esc(p[1]) + '">' +
           esc(p[0]) + '</span>').join('') +
         '</div>' +
@@ -2592,7 +2588,11 @@ function openApiSource(id, providerPreset){
           (v === 'auto' ? 'auto（http + socks5 都试）' : v) + '</option>').join('') +
       '</select><div class="hint">仓库里带 socks5 / https 目录时按路径自动判定，这里是兜底</div></div>' +
       '<div class="field"><label>单源条数上限</label><input id="aCap" type="number" min="1" max="20000" value="' +
-        ((row && row.cap) || 300) + '"></div>' +
+        ((row && row.cap) || 300) + '">' +
+        '<div class="hint">' + (meta.kind === 'api'
+          ? '一次最多取多少条。测绘按结果扣积分（Quake 约 0.5 分/条，300 条约 150 分），' +
+            '别设太大；真能用的比例通常只有 1%~3%'
+          : '一个源最多入库多少条') + '</div></div>' +
     '</div>';
   openModal(id ? '编辑抓取源' :
     (providerPreset ? ('接入 ' + (meta.label || '抓取源')) : '添加自定义源'), body,
@@ -3305,8 +3305,10 @@ function freshDraft(){
     exclusive_id: s.exclusive_id || 0,
     test_url: s.test_url || 'https://www.baidu.com',
     test_keyword: s.test_keyword || '',
+    test_keyword_auto: s.test_keyword_auto !== false,
     max_delay_ms: s.max_delay_ms || 0,
     auto_drop_slow: s.auto_drop_slow !== false,
+    dead_purge_hours: s.dead_purge_hours === undefined ? 2 : s.dead_purge_hours,
     validate_level: s.validate_level || 'standard',
     validate_concurrency: s.validate_concurrency || 80,
     validate_timeout: s.validate_timeout || 8,
@@ -3327,7 +3329,7 @@ function freshDraft(){
     max_retries: s.max_retries == null ? 2 : s.max_retries,
     fail_quarantine: s.fail_quarantine || 4,
     quarantine_seconds: s.quarantine_seconds || 600,
-    revalidate_interval: s.revalidate_interval || 600,
+    revalidate_interval: s.revalidate_interval || 300,
     dedupe_exit: !!s.dedupe_exit,
     weight_health: !!s.weight_health,
     prefer_fast: s.prefer_fast !== false,
@@ -3339,7 +3341,9 @@ function freshDraft(){
     /* ---- 新增：全局并发/补货/预检/节流/连接层/寿命/存池 ---- */
     max_conns_global: s.max_conns_global == null ? 3000 : s.max_conns_global,
     wait_pool_seconds: s.wait_pool_seconds == null ? 30 : s.wait_pool_seconds,
-    precheck_exit: !!s.precheck_exit,
+    precheck_exit: s.precheck_exit !== false,
+    precheck_fresh: s.precheck_fresh || 60,
+    dial_timeout: s.dial_timeout || 5,
     check_cache_seconds: s.check_cache_seconds == null ? 30 : s.check_cache_seconds,
     check_min_interval: s.check_min_interval == null ? 5 : s.check_min_interval,
     check_dup_interval: s.check_dup_interval == null ? 1 : s.check_dup_interval,
@@ -3521,10 +3525,19 @@ const CAT_RENDER = {
   validate(){
     const d = settingsDraft;
     return sTxt('test_url', '验证目标', null, {}) +
-      sTxt('test_keyword', '包含字符串', '空 = 只看状态码。', {ph:'如：百度一下'}) +
+      sTxt('test_keyword', '包含字符串',
+        '响应体里必须出现这段文字才算真能用；留空则按验证目标自动取（baidu → 百度一下）。' +
+        '这一项不能省：实测同一批节点「只看 200」能过 73%，加上内容校验只剩 33%，' +
+        '差的那 40% 全是劫持页 / 假 200 —— 它们进了池子就会让你看到「显示有效却打不开」。',
+        {ph:'空 = 自动（如 百度一下）'}) +
+      sTgl('test_keyword_auto', '自动推断包含字符串',
+        '按验证目标自动选特征串（百度一下 / bing / GitHub 等），省得换目标时忘了改。', {}) +
       sSel('max_delay_ms', '延迟上限', delayOptions(d.max_delay_ms),
         '超过上限的出口即便能连通也不会进候选池、不会出现在订阅里——免费池里 5 秒以上的节点，实际用起来只会一直超时。', {}) +
       sTgl('auto_drop_slow', '验证后直接删除超延迟条目', '关闭则只标成失效、不删除。', {}) +
+      sNum('dead_purge_hours', '死条目自动清理',
+        '从没成功过一次的节点保留几小时后就删掉（0 = 不自动删）。免费池每次抓取几千条，' +
+        '绝大多数一次都连不上，不清会一直堆在库里：统计被稀释、备份变大、扩容判断也失真。', {min:0, max:72}) +
       sSel('validate_level', '验证强度',
         '<option value="fast"' + (d.validate_level === 'fast' ? ' selected' : '') + '>快速：只测 HTTP 连通</option>' +
         '<option value="standard"' + ((d.validate_level || 'standard') === 'standard' ? ' selected' : '') + '>标准：HTTP + HTTPS</option>' +
@@ -3576,12 +3589,16 @@ const CAT_RENDER = {
       sNum('max_retries', '失败自动换出口重试', '次', '-1 = 用尽全池，0 = 不重试。', {min:-1, max:10}) +
       sNum('wait_pool_seconds', '池空等待补货', '秒',
         '没有可用出口时排队等待并持续补货重试，超过这个秒数才报错；0 = 不等待直接报错。', {min:0}) +
-      sTgl('precheck_exit', '取前抢先验',
-        '照 ProxyCat：把选中的出口先预检一次再交给客户端，不合格的丢掉换下一条——避免把第一次失败甩给你。开启后每次请求多一次预检，稍慢。', {}) +
+      sTgl('precheck_exit', '取前抢先验（智能版）',
+        '照 ProxyCat：把选中的出口先检一次再交给客户端，不合格的当场换下一条、并短隔离 3 分钟——不把第一次失败甩给你。智能版只检「超过新鲜期没拨通」的出口，热节点不重复付出握手成本。', {}) +
+      sNum('precheck_fresh', '预检新鲜期', '秒',
+        '这么久内刚拨通过的出口跳过预检。调小更严但每次请求都要多一次握手，调大更快但坏节点可能漏检。', {min:10, step:10}) +
+      sNum('dial_timeout', '拨号超时', '秒',
+        '连不上出口时最多等这么久就换下一个。默认 5 秒；调大对慢出口更宽容，但坏节点会拖更久。', {min:2, max:30}) +
       sNum('fail_quarantine', '连续失败几次进隔离', '次', null, {min:1}) +
       sNum('quarantine_seconds', '隔离冷却', '秒', '连续失败达到次数后先冷却这么久；之后每多失败一次，冷却时长翻倍（上限 24 小时），惯犯不会再每 10 分钟准时复活。', {min:30}) +
       sNum('revalidate_interval', '自动重验证周期', '秒',
-        '后台定期把池内有效出口重测一遍，坏掉的尽快踢出候选。默认 600 秒；调小坏节点退场更快，但会更占验证并发。', {min:120, step:60}) +
+        '后台定期把池内有效出口重测一遍，坏掉的尽快踢出候选。免费节点新鲜度很短，默认 300 秒；调大更省验证并发，但坏节点会赖得更久。', {min:120, step:60}) +
       adv('高级：连接层参数',
         sNum('relay_buffer', '转发缓冲阈值', '字节',
           '客户端读得慢（写缓冲超过这个值）就暂停从上游读，防止内存被慢客户端吃爆。', {min:4096, step:1024}) +
@@ -3785,8 +3802,10 @@ async function submitSettings(){
     bypass_list: String(d.bypass_list || '').trim(),
     test_url: String(d.test_url || '').trim() || 'https://www.baidu.com',
     test_keyword: String(d.test_keyword || '').trim(),
+    test_keyword_auto: !!d.test_keyword_auto,
     max_delay_ms: +d.max_delay_ms || 0,
     auto_drop_slow: !!d.auto_drop_slow,
+    dead_purge_hours: +d.dead_purge_hours || 0,
     validate_concurrency: +d.validate_concurrency || 80,
     validate_timeout: +d.validate_timeout || 8,
     preferred_regions: String(d.preferred_regions || '').trim(),
@@ -3801,7 +3820,7 @@ async function submitSettings(){
     max_conn_per_exit: +d.max_conn_per_exit || 0,
     fail_quarantine: +d.fail_quarantine || 4,
     quarantine_seconds: +d.quarantine_seconds || 600,
-    revalidate_interval: +d.revalidate_interval || 600,
+    revalidate_interval: +d.revalidate_interval || 300,
     max_retries: +d.max_retries || 0,
     dedupe_exit: !!d.dedupe_exit,
     weight_health: !!d.weight_health,
@@ -3814,6 +3833,8 @@ async function submitSettings(){
     max_conns_global: +d.max_conns_global || 0,
     wait_pool_seconds: Math.max(0, +d.wait_pool_seconds || 0),
     precheck_exit: !!d.precheck_exit,
+    precheck_fresh: +d.precheck_fresh || 60,
+    dial_timeout: +d.dial_timeout || 5,
     check_cache_seconds: Math.max(0, +d.check_cache_seconds || 0),
     check_min_interval: Math.max(0, +d.check_min_interval || 0),
     check_dup_interval: Math.max(0, +d.check_dup_interval || 0),

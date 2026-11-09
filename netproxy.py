@@ -22,7 +22,7 @@ import time
 from collections import deque
 
 MAX_HEADER = 128 * 1024
-DIAL_TIMEOUT = 8.0
+DIAL_TIMEOUT = 5.0          # 默认拨号超时；实际值读设置 dial_timeout（见 _dial_to）
 log = logging.getLogger("proxydog.proxy")
 
 
@@ -90,6 +90,7 @@ class ProxyServer:
         self._creds = {}                     # 入站认证账号表 {用户名: 密码}，3 秒缓存
         self._creds_at = 0.0
         self._user_hits = {}                 # 用户名 -> [次数, 最近使用]，由主线程定时落库
+        self._ok_at = {}                     # 出口 id -> 最近一次拨通成功的时间戳（智能预检缓存）
         self.started_at = None
         self.stats = {
             "connections": 0, "success": 0, "fail": 0,
@@ -309,10 +310,10 @@ class ProxyServer:
         """
         if not s.get("prefer_fast") or s.get("infinite_mode") or len(pool) <= 2:
             return pool
-        window = max(120, int(s.get("fast_window_ms") or 500))
+        window = max(120, int(s.get("fast_window_ms") or 300))
         ranked = sorted(pool, key=lambda d: float(d.get("delay_ms") or 99999))
         fastest = float(ranked[0].get("delay_ms") or 0)
-        cap_n = max(3, int(len(ranked) * 0.25))
+        cap_n = max(3, int(len(ranked) * 0.20))
         out = [d for d in ranked[:cap_n]
                if float(d.get("delay_ms") or 99999) <= fastest + window]
         return out or ranked[:2]
@@ -665,26 +666,35 @@ class ProxyServer:
         last_err = ""
         tgt = target or f"{host}:{port}"
         precheck = bool(s.get("precheck_exit"))
+        # 智能预检新鲜期：刚拨通过的出口不必再预检（否则每次请求都多一次握手）
+        fresh = max(10.0, float(s.get("precheck_fresh") or 90))
         for _ in range(tries):
             exit_row = None
             try:
                 exit_row = await self._pick_or_replenish(
                     tgt, client=client, session=session, exclude=tried or None)
-                # 取前抢先验（照 ProxyCat）：把选中的出口先预检一次再交给客户端，
-                # 不合格的丢掉换下一条，避免把第一次失败甩给用户
-                if precheck and exit_row is not None:
+                # 取前抢先验（照 ProxyCat）：把选中的出口先检一次再交给客户端，
+                # 不合格的丢掉换下一条，避免把第一次失败甩给用户。
+                # 智能版：只对「最近没拨通过」的出口做，命中率更高的同时不拖慢热节点。
+                if (precheck and exit_row is not None
+                        and time.time() - self._ok_at.get(exit_row["id"], 0) > fresh):
                     try:
                         pc_r, pc_w = await asyncio.wait_for(
                             asyncio.open_connection(exit_row["host"],
-                                                    int(exit_row["port"])), 4.0)
+                                                    int(exit_row["port"])), 3.5)
                         pc_w.close()
+                        self._ok_at[exit_row["id"]] = time.time()
                     except Exception:
                         self._mark(exit_row, False, None)
+                        # 预检都不通：立刻短隔离，别让它继续参与轮换
+                        self.store.quarantine(exit_row["id"], 180)
                         tried.add(exit_row["id"])
                         self._pick_reason = f"precheck-fail#{len(tried)}"
                         log.info("取前预检失败，已换下一条：#%s", exit_row["id"])
                         continue
                 up_r, up_w = await self._dial(exit_row, host, port, tunnel=tunnel)
+                if exit_row is not None:
+                    self._ok_at[exit_row["id"]] = time.time()   # 记下“刚拨通过”，省掉下次预检
                 if tried:
                     self._pick_reason = f"retry#{len(tried)}"
                 return exit_row, up_r, up_w
@@ -1096,13 +1106,22 @@ class ProxyServer:
         return buf
 
     # ---------------- 上游拨号 ----------------
+    def _dial_to(self, s=None):
+        """拨号超时：默认 5 秒。免费出口建连慢的本来就该淘汰，放 8 秒只会让
+        一次坏出口把请求卡到 20 秒以上（重试 3 次）。"""
+        try:
+            v = float((s or self._settings()).get("dial_timeout") or DIAL_TIMEOUT)
+        except (TypeError, ValueError):
+            v = DIAL_TIMEOUT
+        return max(2.0, min(30.0, v))
+
     async def _dial(self, exit_row, host, port, tunnel=True, resolve=True):
+        s = self._settings()
         if exit_row is None:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port, limit=MAX_HEADER), DIAL_TIMEOUT)
+                asyncio.open_connection(host, port, limit=MAX_HEADER), self._dial_to(s))
             return reader, writer
 
-        s = self._settings()
         if resolve:
             host = await self._resolve_target(exit_row, host)
         # 多跳上游链：池里的出口当第一跳，后面按 chain_hops 依次串 SOCKS5
@@ -1114,7 +1133,7 @@ class ProxyServer:
         ctx = self._ssl if proto == "https" else None
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(exit_row["host"], int(exit_row["port"]),
-                                    ssl=ctx, limit=MAX_HEADER), DIAL_TIMEOUT)
+                                    ssl=ctx, limit=MAX_HEADER), self._dial_to(s))
         try:
             if proto == "socks5":
                 await self._socks5_upstream(reader, writer, exit_row, host, port)
@@ -1215,7 +1234,7 @@ class ProxyServer:
         ctx = self._ssl if proto == "https" else None
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(exit_row["host"], int(exit_row["port"]),
-                                    ssl=ctx, limit=MAX_HEADER), DIAL_TIMEOUT)
+                                    ssl=ctx, limit=MAX_HEADER), self._dial_to())
         try:
             # 池出口 → 第一跳
             if proto == "socks5":
